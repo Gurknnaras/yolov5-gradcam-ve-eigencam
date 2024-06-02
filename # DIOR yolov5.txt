@@ -1,0 +1,496 @@
+# DIOR veri kümesi eğitimi ve analizi
+!git clone https://github.com/ultralytics/yolov5  # clone
+  %cd yolov5
+  %pip install -qr requirements.txt comet_ml  # install
+
+  import torch
+  import utils
+  display = utils.notebook_init()  # checks
+  import os
+%pip install  -q roboflow
+# environment'ı kuruyoruz
+os.environ["DATASET_DIRECTORY"] = "/content/datasets"
+!pip install roboflow
+
+from roboflow import Roboflow
+rf = Roboflow(api_key="BrzN1PIwrE13wASFivVz")
+project = rf.workspace("kocaeli-university-d5zh0").project("dior_berkant")
+version = project.version(2)
+dataset = version.download("yolov5")
+!python train.py --img 640 --batch 16 --epochs 184 --data {dataset.location}/data.yaml --weights yolov5s.pt --cache
+!python detect.py --weights /content/yolov5/yolov5/runs/train/exp/weights/best.pt --img 640 --conf 0.2 --source {dataset.location}/test/images
+!python test.py --weights /content/yolov5/runs/train/exp/weights/best.pt --data {dataset.location}/data.yaml --img 640 --save-json --project /content/yolov5/runs/test/
+
+from google.colab import files
+files.download('./runs/train/exp/weights/best.pt')
+
+  # Eigen-CAM için gerekli kütüphane kurulumları yapılmıştır
+import os
+import numpy as np
+import pandas as pd
+import ast
+import torch
+import PIL
+from tqdm.auto import tqdm
+import shutil as sh
+from pathlib import Path
+import random
+from IPython.display import Image, clear_output
+import matplotlib.pyplot as plt
+%matplotlib inline
+
+  # drive'a bağlantı yapılımıştır
+  from google.colab import drive
+  drive.mount('/content/hdrive')
+
+  # Grad-CAM deposu colab ortamına klonlanmıştır
+  !pip install git+https://github.com/jacobgil/pytorch-grad-cam.git
+  !pip install grad-cam==1.4.6
+
+
+# Eigen-CAM için gerekli modüller import edilmesi ve ısı haritası oluşturma
+import warnings
+warnings.filterwarnings('ignore')
+warnings.simplefilter('ignore')
+import torch
+import cv2
+import numpy as np
+import requests
+import torchvision.transforms as transforms
+from pytorch_grad_cam import EigenCAM
+from pytorch_grad_cam.utils.image import show_cam_on_image, scale_cam_image
+from PIL import Image
+
+COLORS = np.random.uniform(0, 255, size=(80, 3))
+
+def parse_detections(results):
+    detections = results.pandas().xyxy[0]
+    detections = detections.to_dict()
+    boxes, colors, names = [], [], []
+
+    for i in range(len(detections["xmin"])):
+        confidence = detections["confidence"][i]
+        if confidence < 0.2:
+            continue
+        xmin = int(detections["xmin"][i])
+        ymin = int(detections["ymin"][i])
+        xmax = int(detections["xmax"][i])
+        ymax = int(detections["ymax"][i])
+        name = detections["name"][i]
+        category = int(detections["class"][i])
+        color = COLORS[category]
+
+        boxes.append((xmin, ymin, xmax, ymax))
+        colors.append(color)
+        names.append(name)
+    return boxes, colors, names
+
+def draw_detections(boxes, colors, names, img):
+    for box, color, name in zip(boxes, colors, names):
+        xmin, ymin, xmax, ymax = box
+        cv2.rectangle(
+            img,
+            (xmin, ymin),
+            (xmax, ymax),
+            color,
+            2)
+
+        cv2.putText(img, name, (xmin, ymin - 5),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.8, color, 2,
+                    lineType=cv2.LINE_AA)
+    return img
+
+image_url = "/content/hdrive/MyDrive/DIOR_BERKANT.v2i.yolov5pytorch/test/images/00084_jpg.rf.58f7d55f61ef907e65ed0e6bbd3f2897.jpg"
+img = np.array(Image.open(image_url))
+img = cv2.resize(img, (640, 640))
+rgb_img = img.copy()
+img = np.float32(img) / 255
+transform = transforms.ToTensor()
+tensor = transform(img).unsqueeze(0)
+tensor.requires_grad = True
+
+model_path = '/content/best (10).pt'
+
+model = torch.hub.load('ultralytics/yolov5', 'custom', path=model_path)
+
+model.eval()
+model.cpu()
+target_layers = [model.model.model.model[-2]]
+
+results = model([rgb_img])
+boxes, colors, names = parse_detections(results)
+detections = draw_detections(boxes, colors, names, rgb_img.copy())
+Image.fromarray(detections)
+
+cam = EigenCAM(model, target_layers)
+grayscale_cam = cam(tensor)[0, :, :]
+grayscale_cam = np.maximum(grayscale_cam, 0)
+grayscale_cam = grayscale_cam / grayscale_cam.max()
+cam_image = show_cam_on_image(rgb_img / 255.0, grayscale_cam, use_rgb=True)
+
+Image.fromarray(cam_image)
+
+
+
+# Maskeleme işlemi ve  mAP değerinin hesaplanması
+
+import os
+import numpy as np
+import torch
+from PIL import Image
+from pytorch_grad_cam import EigenCAM
+from pytorch_grad_cam.utils.image import show_cam_on_image
+import torchvision.transforms as transforms
+import cv2
+from sklearn.metrics import precision_recall_curve, average_precision_score
+import matplotlib.pyplot as plt
+
+def load_ground_truth(label_path, img_width=640, img_height=640):
+    with open(label_path, 'r') as file:
+        lines = file.readlines()
+    
+    gt_boxes = []
+    for line in lines:
+        parts = line.strip().split()
+        class_id = int(parts[0])
+        center_x = float(parts[1]) * img_width
+        center_y = float(parts[2]) * img_height
+        width = float(parts[3]) * img_width
+        height = float(parts[4]) * img_height
+
+        xmin = int(center_x - width / 2)
+        ymin = int(center_y - height / 2)
+        xmax = int(center_x + width / 2)
+        ymax = int(center_y + height / 2)
+
+        gt_boxes.append((xmin, ymin, xmax, ymax, class_id))
+    
+    return gt_boxes
+
+def get_bounding_boxes_from_cam(cam_image, threshold=0.5):
+    cam_gray = cv2.cvtColor(cam_image, cv2.COLOR_RGB2GRAY)
+    _, binary_cam = cv2.threshold(cam_gray, int(threshold * 255), 255, cv2.THRESH_BINARY)
+    
+    contours, _ = cv2.findContours(binary_cam, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    boxes = []
+    for cnt in contours:
+        x, y, w, h = cv2.boundingRect(cnt)
+        # Geçici sınıf bilgisi ekleniyor (örneğin, 0 olarak varsayalım)
+        boxes.append((x, y, x+w, y+h, 0))
+    
+    return boxes
+
+def calculate_precision_recall(ground_truths, predictions, num_classes):
+    all_precisions = []
+    all_recalls = []
+    aps = []
+
+    for cls in range(num_classes):
+        gt_cls = []
+        pred_cls = []
+
+        for gt, pred in zip(ground_truths, predictions):
+            gt_cls.append([box for box in gt if box[4] == cls])
+            pred_cls.append([box for box in pred if box[4] == cls])
+
+        precision, recall, _ = precision_recall_curve(
+            [1 if len(gt) > 0 else 0 for gt in gt_cls],
+            [1 if len(pred) > 0 else 0 for pred in pred_cls]
+        )
+        ap = average_precision_score(
+            [1 if len(gt) > 0 else 0 for gt in gt_cls],
+            [1 if len(pred) > 0 else 0 for pred in pred_cls]
+        )
+
+        all_precisions.append(precision)
+        all_recalls.append(recall)
+        aps.append(ap)
+
+    return all_precisions, all_recalls, aps
+
+def calculate_map(aps):
+    return sum(aps) / len(aps)
+
+def mask_image_using_heatmap(img, heatmap, threshold=0.2):
+    mask = heatmap > threshold
+    masked_img = img * np.expand_dims(mask, axis=-1)
+    return masked_img
+
+model_path = '/content/best (10).pt'
+model = torch.hub.load('ultralytics/yolov5', 'custom', path=model_path)
+model.eval()
+model.cpu()
+target_layers = [model.model.model.model[-2]]
+
+image_folder = "/content/hdrive/MyDrive/DIOR_BERKANT.v2i.yolov5pytorch/test/images"
+label_folder = "/content/hdrive/MyDrive/DIOR_BERKANT.v2i.yolov5pytorch/test/labels"
+
+image_paths = [os.path.join(image_folder, f) for f in os.listdir(image_folder) if f.endswith('.jpg')]
+label_paths = [os.path.join(label_folder, f) for f in os.listdir(label_folder) if f.endswith('.txt')]
+
+ground_truths = []
+masked_predictions = []
+
+transform = transforms.ToTensor()
+
+for img_path, label_path in zip(image_paths, label_paths):
+    
+    img = np.array(Image.open(img_path))
+    img_resized = cv2.resize(img, (640, 640))
+    rgb_img = img_resized.copy()
+    img_resized = np.float32(img_resized) / 255
+    tensor = transform(img_resized).unsqueeze(0)
+    tensor.requires_grad = True
+    
+ 
+    cam = EigenCAM(model, target_layers)
+    grayscale_cam = cam(tensor)[0, :, :]
+    grayscale_cam = np.maximum(grayscale_cam, 0)
+    grayscale_cam = grayscale_cam / grayscale_cam.max()
+    cam_image = show_cam_on_image(rgb_img / 255.0, grayscale_cam, use_rgb=True)
+    
+    
+    masked_img = mask_image_using_heatmap(img_resized, grayscale_cam, threshold=0.5)
+        cam_boxes = get_bounding_boxes_from_cam(masked_img)
+    
+    gt_boxes = load_ground_truth(label_path)
+    
+    ground_truths.append(gt_boxes)
+    masked_predictions.append(cam_boxes)
+
+precisions, recalls, aps = calculate_precision_recall(ground_truths, masked_predictions, num_classes=20)
+map_score_masked = calculate_map(aps)
+
+print(f"Masked mAP Score: {map_score_masked:.4f}")
+
+# Gradcam ısı haritası oluşturma
+import os
+import numpy as np
+import pandas as pd
+import ast
+import torch
+import PIL
+from tqdm.auto import tqdm
+import shutil as sh
+from pathlib import Path
+import random
+from IPython.display import Image, clear_output
+import matplotlib.pyplot as plt
+%matplotlib inline
+
+from google.colab import drive
+drive.mount('/content/hdrive')
+!pip install git+https://github.com/jacobgil/pytorch-grad-cam.git
+!pip install grad-cam==1.4.6
+
+import warnings
+warnings.filterwarnings('ignore')
+warnings.simplefilter('ignore')
+import torch
+import cv2
+import numpy as np
+import requests
+import torchvision.transforms as transforms
+from pytorch_grad_cam import GradCAM
+from pytorch_grad_cam.utils.image import show_cam_on_image, scale_cam_image
+from PIL import Image
+
+COLORS = np.random.uniform(0, 255, size=(80, 3))
+
+def parse_detections(results):
+    detections = results.pandas().xyxy[0]
+    detections = detections.to_dict()
+    boxes, colors, names = [], [], []
+
+    for i in range(len(detections["xmin"])):
+        confidence = detections["confidence"][i]
+        if confidence < 0.2:
+            continue
+        xmin = int(detections["xmin"][i])
+        ymin = int(detections["ymin"][i])
+        xmax = int(detections["xmax"][i])
+        ymax = int(detections["ymax"][i])
+        name = detections["name"][i]
+        category = int(detections["class"][i])
+        color = COLORS[category]
+
+        boxes.append((xmin, ymin, xmax, ymax))
+        colors.append(color)
+        names.append(name)
+    return boxes, colors, names
+
+def draw_detections(boxes, colors, names, img):
+    for box, color, name in zip(boxes, colors, names):
+        xmin, ymin, xmax, ymax = box
+        cv2.rectangle(
+            img,
+            (xmin, ymin),
+            (xmax, ymax),
+            color,
+            2)
+
+        cv2.putText(img, name, (xmin, ymin - 5),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.8, color, 2,
+                    lineType=cv2.LINE_AA)
+    return img
+
+image_url = "/content/hdrive/MyDrive/DIOR_BERKANT.v2i.yolov5pytorch/test/images/00084_jpg.rf.58f7d55f61ef907e65ed0e6bbd3f2897.jpg"
+img = np.array(Image.open(image_url))
+img = cv2.resize(img, (640, 640))
+rgb_img = img.copy()
+img = np.float32(img) / 255
+transform = transforms.ToTensor()
+tensor = transform(img).unsqueeze(0)
+tensor.requires_grad = True
+
+model_path = '/content/best (10).pt'
+model = torch.hub.load('ultralytics/yolov5', 'custom', path=model_path)
+model.eval()
+model.cpu()
+
+
+target_layers = [model.model.model.model[-2]]
+
+# Sonuçları alın ve tespitleri çözümleyin
+results = model([rgb_img])
+boxes, colors, names = parse_detections(results)
+detections = draw_detections(boxes, colors, names, rgb_img.copy())
+Image.fromarray(detections)
+
+cam = GradCAM(model, target_layers)
+
+# Grad-CAM'i hesaplayın ve normalize edin
+grayscale_cam = cam(tensor)[0, 0, :, :]
+grayscale_cam = np.maximum(grayscale_cam, 0)
+grayscale_cam = grayscale_cam / grayscale_cam.max()
+
+cam_image = show_cam_on_image(rgb_img / 255.0, grayscale_cam, use_rgb=True)
+Image.fromarray(cam_image)
+
+# Gradcam için maskeleme işlemi ve mAP hesaplanması
+
+import os
+import numpy as np
+import torch
+from PIL import Image
+from pytorch_grad_cam import GradCAM
+from pytorch_grad_cam.utils.image import show_cam_on_image
+import torchvision.transforms as transforms
+import cv2
+from sklearn.metrics import precision_recall_curve, average_precision_score
+import matplotlib.pyplot as plt
+
+def load_ground_truth(label_path, img_width=640, img_height=640):
+    with open(label_path, 'r') as file:
+        lines = file.readlines()
+    
+    gt_boxes = []
+    for line in lines:
+        parts = line.strip().split()
+        class_id = int(parts[0])
+        center_x = float(parts[1]) * img_width
+        center_y = float(parts[2]) * img_height
+        width = float(parts[3]) * img_width
+        height = float(parts[4]) * img_height
+
+        xmin = int(center_x - width / 2)
+        ymin = int(center_y - height / 2)
+        xmax = int(center_x + width / 2)
+        ymax = int(center_y + height / 2)
+
+        gt_boxes.append((xmin, ymin, xmax, ymax, class_id))
+    
+    return gt_boxes
+
+def get_bounding_boxes_from_cam(cam_image, threshold=0.5):
+    cam_gray = cv2.cvtColor(cam_image, cv2.COLOR_RGB2GRAY)
+    _, binary_cam = cv2.threshold(cam_gray, int(threshold * 255), 255, cv2.THRESH_BINARY)
+    
+    contours, _ = cv2.findContours(binary_cam, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    boxes = []
+    for cnt in contours:
+        x, y, w, h = cv2.boundingRect(cnt)
+        # Geçici sınıf bilgisi ekleniyor (örneğin, 0 olarak varsayalım)
+        boxes.append((x, y, x+w, y+h, 0))
+    
+    return boxes
+
+def calculate_precision_recall(ground_truths, predictions, num_classes):
+    all_precisions = []
+    all_recalls = []
+    aps = []
+
+    for cls in range(num_classes):
+        gt_cls = []
+        pred_cls = []
+
+        for gt, pred in zip(ground_truths, predictions):
+            gt_cls.append([box for box in gt if box[4] == cls])
+            pred_cls.append([box for box in pred if box[4] == cls])
+
+        precision, recall, _ = precision_recall_curve(
+            [1 if len(gt) > 0 else 0 for gt in gt_cls],
+            [1 if len(pred) > 0 else 0 for pred in pred_cls]
+        )
+        ap = average_precision_score(
+            [1 if len(gt) > 0 else 0 for gt in gt_cls],
+            [1 if len(pred) > 0 else 0 for pred in pred_cls]
+        )
+
+        all_precisions.append(precision)
+        all_recalls.append(recall)
+        aps.append(ap)
+
+    return all_precisions, all_recalls, aps
+
+def calculate_map(aps):
+    return sum(aps) / len(aps)
+
+def mask_image_using_heatmap(img, heatmap, threshold=0.2):
+    mask = heatmap > threshold
+    masked_img = img * np.expand_dims(mask, axis=-1)
+    return masked_img
+
+model_path = '/content/best (10).pt'
+model = torch.hub.load('ultralytics/yolov5', 'custom', path=model_path)
+model.eval()
+model.cpu()
+target_layers = [model.model.model.model[-2]]
+
+image_folder = "/content/hdrive/MyDrive/DIOR_BERKANT.v2i.yolov5pytorch/test/images"
+label_folder = "/content/hdrive/MyDrive/DIOR_BERKANT.v2i.yolov5pytorch/test/labels"
+
+image_paths = [os.path.join(image_folder, f) for f in os.listdir(image_folder) if f.endswith('.jpg')]
+label_paths = [os.path.join(label_folder, f) for f in os.listdir(label_folder) if f.endswith('.txt')]
+
+ground_truths = []
+masked_predictions = []
+
+transform = transforms.ToTensor()
+
+for img_path, label_path in zip(image_paths, label_paths):
+    
+    img = np.array(Image.open(img_path))
+    img_resized = cv2.resize(img, (640, 640))
+    rgb_img = img_resized.copy()
+    img_resized = np.float32(img_resized) / 255
+    tensor = transform(img_resized).unsqueeze(0)
+    tensor.requires_grad = True
+    
+    cam = GradCAM(model, target_layers)
+    grayscale_cam = cam(tensor)[0, 0, :, :]
+    grayscale_cam = np.maximum(grayscale_cam, 0)
+    grayscale_cam = grayscale_cam / grayscale_cam.max()
+    cam_image = show_cam_on_image(rgb_img / 255.0, grayscale_cam, use_rgb=True)
+    
+    masked_img = mask_image_using_heatmap(img_resized, grayscale_cam, threshold=0.5)
+    cam_boxes = get_bounding_boxes_from_cam(masked_img)
+     gt_boxes = load_ground_truth(label_path)
+    
+  ground_truths.append(gt_boxes)
+    masked_predictions.append(cam_boxes)
+
+precisions, recalls, aps = calculate_precision_recall(ground_truths, masked_predictions, num_classes=20)
+map_score_masked = calculate_map(aps)
+
+print(f"Masked mAP Score: {map_score_masked:.4f}")
